@@ -1,0 +1,109 @@
+name: vc-listener
+
+on:
+  workflow_dispatch:
+    inputs:
+      slot:
+        description: "session slot (leave A)"
+        required: false
+        default: "A"
+      handover:
+        description: "internal (leave empty)"
+        required: false
+        default: ""
+  # backup only: if the chain of jobs ever breaks, this brings the listener back within ~30 min
+  schedule:
+    - cron: "*/30 * * * *"
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  listen:
+    runs-on: ubuntu-latest
+    timeout-minutes: 358
+    steps:
+      # exit right away if another listener is already running (schedule / manual start)
+      - name: Already running?
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          if [ "${{ inputs.handover }}" = "1" ]; then echo "skip=false" >> "$GITHUB_OUTPUT"; exit 0; fi
+          n=0
+          for s in in_progress queued; do
+            c=$(gh run list -w listener.yml -s "$s" -L 20 --json databaseId \
+                -q "[.[] | select(.databaseId != ${{ github.run_id }})] | length")
+            n=$((n + c))
+          done
+          if [ "$n" -gt 0 ]; then
+            echo "a listener is already running, nothing to do"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/checkout@v4
+        if: steps.check.outputs.skip != 'true'
+
+      - uses: actions/setup-python@v5
+        if: steps.check.outputs.skip != 'true'
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install ffmpeg
+        if: steps.check.outputs.skip != 'true'
+        run: command -v ffmpeg >/dev/null || (sudo apt-get update -qq && sudo apt-get install -y -qq ffmpeg)
+
+      - name: Install python packages
+        if: steps.check.outputs.skip != 'true'
+        run: pip install -q -r requirements.txt
+
+      - name: Listen and record
+        if: steps.check.outputs.skip != 'true'
+        env:
+          PYTHONUNBUFFERED: "1"
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_A: ${{ secrets.SESSION_A }}
+          SESSION_B: ${{ secrets.SESSION_B }}
+          SOURCE_CHAT_ID: ${{ secrets.SOURCE_CHAT_ID }}
+          DEST_CHAT_ID: ${{ secrets.DEST_CHAT_ID }}
+          ADMIN_IDS: ${{ secrets.ADMIN_IDS }}
+          SLOT: ${{ inputs.slot || 'A' }}
+          IS_HANDOVER: ${{ inputs.handover }}
+          GH_TOKEN: ${{ github.token }}
+        run: python listener.py
+
+      # files whose upload failed: kept 3 days, ENCRYPTED (artifacts of a public repo are downloadable by anyone)
+      - name: Encrypt failed uploads
+        if: always() && steps.check.outputs.skip != 'true' && hashFiles('rec/failed/*.mp3') != ''
+        env:
+          ARCHIVE_PASSWORD: ${{ secrets.ARCHIVE_PASSWORD }}
+        run: |
+          if [ -z "$ARCHIVE_PASSWORD" ]; then
+            echo "ARCHIVE_PASSWORD not set, failed files are discarded"
+            rm -f rec/failed/*.mp3
+            exit 0
+          fi
+          for f in rec/failed/*.mp3; do
+            openssl enc -aes-256-cbc -pbkdf2 -salt -in "$f" -out "$f.enc" -pass env:ARCHIVE_PASSWORD && rm -f "$f"
+          done
+
+      - uses: actions/upload-artifact@v4
+        if: always() && steps.check.outputs.skip != 'true' && hashFiles('rec/failed/*.enc') != ''
+        with:
+          name: failed-recordings
+          path: rec/failed/*.enc
+          retention-days: 3
+
+      # the job ended without a successor (e.g. the hand-over dispatch failed): start a new listener now
+      - name: Restart listener
+        if: always() && steps.check.outputs.skip != 'true' && hashFiles('restart.flag') != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh workflow run listener.yml --ref "${{ github.ref_name }}" -f slot="$(cat restart.flag)" -f handover=1
