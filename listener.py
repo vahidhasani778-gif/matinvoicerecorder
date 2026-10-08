@@ -48,7 +48,7 @@ RUN_SECONDS = env_int("RUN_SECONDS", 5 * 3600 + 40 * 60)   # give up waiting for
 POLL = env_int("POLL", 15)                                 # fallback check interval
 WATCHDOG_EVERY = env_int("WATCHDOG_EVERY", 60)
 ALONE_TIMEOUT = env_int("ALONE_TIMEOUT", 180)              # stop if nobody else is in the call (0 = off)
-BITRATE = os.environ.get("BITRATE") or "64k"
+BITRATE = os.environ.get("BITRATE") or "128k"
 NOTIFY_START = (os.environ.get("NOTIFY_START") or "1") == "1"
 TZ = ZoneInfo(os.environ.get("TZ_NAME") or "Asia/Tehran")
 REC_DIR = os.path.abspath("rec")
@@ -101,7 +101,9 @@ def merge_segments(segments, dst, bitrate=BITRATE):
             f.write("file '%s'\n" % s.replace("'", "'\\''"))
     r = subprocess.run(["ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
                         "-f", "concat", "-safe", "0", "-i", lst,
-                        "-vn", "-ac", "1", "-c:a", "libmp3lame", "-b:a", bitrate,
+                        "-vn", "-ar", "48000", "-ac", "2", "-af",
+                        "aresample=async=1000:min_hard_comp=0.100:first_pts=0",
+                        "-c:a", "libmp3lame", "-b:a", bitrate,
                         "-write_xing", "1", dst])
     if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) < 2000:
         log("concat failed, trying fallback")
@@ -109,7 +111,7 @@ def merge_segments(segments, dst, bitrate=BITRATE):
         for i, s in enumerate(segs):
             t = f"{dst}.{i}.mp3"
             if subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-i", s, "-vn", "-ac", "1",
-                               "-c:a", "libmp3lame", "-b:a", bitrate, t]).returncode == 0:
+                               "-ar", "48000", "-c:a", "libmp3lame", "-b:a", bitrate, t]).returncode == 0:
                 tmp.append(t)
         if not tmp:
             return False
@@ -248,10 +250,58 @@ async def main() -> int:
     kicked = asyncio.Event()
     successor_ready = asyncio.Event()
     state = {"rec": None, "skip_call": None, "force": False, "retry_after": 0.0, "failed_call": None,
-             "ignore_kick_until": 0.0}
+             "ignore_kick_until": 0.0, "presence": {}, "presence_names": {}}
     uploads = set()
     join_lock = asyncio.Lock()
     os.makedirs(FAILED_DIR, exist_ok=True)
+
+    async def participant_name(peer):
+        """Resolve a participant to a stable, readable name without logging it."""
+        try:
+            pid = utils.get_peer_id(peer)
+        except Exception:
+            pid = str(peer)
+        if pid in state["presence_names"]:
+            return state["presence_names"][pid]
+        try:
+            entity = await client.get_entity(peer)
+            first = (getattr(entity, "first_name", None) or "").strip()
+            last = (getattr(entity, "last_name", None) or "").strip()
+            name = " ".join(x for x in (first, last) if x).strip()
+            username = (getattr(entity, "username", None) or "").strip()
+            if not name:
+                name = f"@{username}" if username else str(pid)
+            elif username:
+                name = f"{name} (@{username})"
+        except Exception:
+            name = str(pid)
+        state["presence_names"][pid] = name
+        return name
+
+    async def presence_changed(peer, active, initial=False):
+        """Track explicit Telegram participant updates against this recording clock."""
+        try:
+            pid = utils.get_peer_id(peer)
+        except Exception:
+            pid = str(peer)
+        name = await participant_name(peer)
+        previous = state["presence"].get(pid)
+        state["presence"][pid] = active
+        rec = state["rec"]
+        if rec is None:
+            return
+        if not initial and previous is not None and previous == active:
+            return
+        offset = max(0.0, time.monotonic() - rec.mono0)
+        rec.presence_events.append((offset, "ورود" if active else "خروج", name))
+
+    async def process_participant_update(update):
+        participants = getattr(update, "participants", None) or []
+        for p in participants:
+            peer = getattr(p, "peer", None)
+            if peer is None:
+                continue
+            await presence_changed(peer, not getattr(p, "left", False))
 
     # ---- fast detection: Telegram pushes these the moment a voice chat starts/ends
     @client.on(events.Raw)
@@ -260,6 +310,12 @@ async def main() -> int:
             cid = getattr(u, "chat_id", None)
             if cid is None or cid == src_bare:
                 poke.set()
+        elif isinstance(u, types.UpdateGroupCallParticipants):
+            try:
+                if getattr(u.call, "id", None) == getattr(state.get("rec"), "call_id", None):
+                    await process_participant_update(u)
+            except Exception:
+                pass
         elif isinstance(u, (types.UpdateNewChannelMessage, types.UpdateNewMessage)):
             m = u.message
             if isinstance(m, types.MessageService) and isinstance(m.action, types.MessageActionGroupCall):
@@ -324,7 +380,9 @@ async def main() -> int:
             self.started = datetime.datetime.now(TZ)
             self.stamp = self.started.strftime("%Y-%m-%d_%H-%M-%S")
             self.t0 = time.time()
+            self.mono0 = time.monotonic()
             self.segments = []
+            self.presence_events = []
             self.status_msg = None
             self.continued = continued
             self.taken_over = False
@@ -374,8 +432,47 @@ async def main() -> int:
                 return
             log(f"joined in {time.time() - t:.1f}s")
             state["rec"] = rec
+            try:
+                snapshot = await client(GetGroupParticipantsRequest(
+                    call=call, ids=[], sources=[], offset="", limit=100))
+                for p in getattr(snapshot, "participants", []) or []:
+                    peer = getattr(p, "peer", None)
+                    if peer is not None and not getattr(p, "left", False):
+                        await presence_changed(peer, True, initial=True)
+            except Exception as e:
+                log("participant snapshot error:", err(e))
             if NOTIFY_START:
                 rec.status_msg = await notify(f"🔴 در حال ضبط ویس‌چت «{title}»")
+
+    def write_presence_timeline(rec, path, duration):
+        timeline = path.replace(".mp3", "_participants.txt")
+        events = sorted(rec.presence_events, key=lambda x: x[0])
+        lines = [
+            f"ویس‌چت: {title}",
+            f"شروع ضبط: {rec.started.strftime('%Y/%m/%d %H:%M:%S')}",
+            "زمان‌ها نسبت به ابتدای همین فایل صوتی هستند.",
+            "",
+        ]
+        seen = set()
+        for offset, action, name in events:
+            key = (round(offset, 1), action, name)
+            if key in seen:
+                continue
+            seen.add(key)
+            total_ms = int(offset * 1000)
+            mm, rem = divmod(total_ms, 60000)
+            ss, ms = divmod(rem, 1000)
+            lines.append(f"{mm:02d}:{ss:02d}.{ms:03d} | {action} | {name}")
+        if not events:
+            lines.append("رویداد ورود/خروجی از تلگرام دریافت نشد.")
+        lines.extend(["", f"پایان ضبط: {fmt_dur(duration)}"])
+        active_names = {name for _, action, name in events if action == "ورود"} - {
+            name for _, action, name in events if action == "خروج"}
+        if active_names:
+            lines.append("حاضر تا پایان فایل: " + ", ".join(sorted(active_names)))
+        with open(timeline, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return timeline
 
     async def finalize(rec):
         await asyncio.sleep(3)
@@ -412,6 +509,11 @@ async def main() -> int:
                 else:
                     os.replace(path, os.path.join(FAILED_DIR, f"rec_{rec.stamp}_{i}.mp3"))
                     await notify(caption + "\n⚠️ آپلود ناموفق بود. فایل رمزگذاری‌شده توی Artifacts همین اجرای GitHub هست.")
+            timeline = write_presence_timeline(rec, final, duration)
+            try:
+                await client.send_file(dst, timeline, caption="📄 زمان‌بندی ورود و خروج اعضای ویس‌چت")
+            except Exception as e:
+                log("participant timeline upload failed:", err(e))
         except Exception as e:
             log("finalize error:", err(e))
         finally:
